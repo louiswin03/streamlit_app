@@ -6,6 +6,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import date, datetime
 
@@ -20,6 +21,10 @@ import risk_engine as rk
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
+PORTFOLIO_VALUE = 10_000.0
+STUDY_START = date(2019, 1, 1)
+STUDY_END = date(2026, 10, 8)
+RISK_FREE_RATE = 0.02
 
 st.set_page_config(page_title="Portfolio Risk Engine", page_icon="📉", layout="wide",
                    initial_sidebar_state="expanded")
@@ -112,23 +117,25 @@ DEFAULT_PORTFOLIO = pd.DataFrame({
 with st.sidebar:
     st.markdown("### Portfolio Risk Engine")
     st.caption("Set the portfolio and the risk parameters, then run the analysis. Stress scenarios are set in the Stress tests tab.")
+    st.markdown("## Portfolio")
+    st.caption("Yahoo Finance symbols (e.g. MC.PA for LVMH in Paris, BTC-USD for Bitcoin). Add or delete rows freely.")
+    port_df = st.data_editor(
+        DEFAULT_PORTFOLIO, num_rows="dynamic", width="stretch", hide_index=True, key="port_editor",
+        column_config={
+            "Ticker": st.column_config.TextColumn("Ticker", required=True, max_chars=15),
+            "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, step=0.5, format="%.1f"),
+            "Asset class": st.column_config.TextColumn("Asset class"),
+        })
+    has_ticker = port_df["Ticker"].fillna("").astype(str).str.strip().ne("")
+    total_weight = pd.to_numeric(port_df.loc[has_ticker, "Weight (%)"], errors="coerce").sum()
+    st.markdown(f"**Total weight: {total_weight:.1f}% / 100%**")
+    if abs(total_weight - 100) > 0.01:
+        st.caption("Adjust the weights to reach 100% before running the analysis.")
+    st.markdown("**Portfolio value: €10,000 (fixed)**")
+    st.caption("Fixed study period: 1 January 2019 – 8 October 2026, inclusive. "
+               "The saved portfolio's common trading-day prices start on 2 January 2019. "
+               "Risk estimates use the most recent trading days selected below within this period.")
     with st.form("settings", border=False):
-        st.markdown("## Portfolio")
-        st.caption("Yahoo Finance symbols (e.g. MC.PA for LVMH in Paris, BTC-USD for Bitcoin). Add or delete rows freely.")
-        port_df = st.data_editor(
-            DEFAULT_PORTFOLIO, num_rows="dynamic", width="stretch", hide_index=True, key="port_editor",
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker", required=True, max_chars=15),
-                "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, step=0.5, format="%.1f"),
-                "Asset class": st.column_config.TextColumn("Asset class"),
-            })
-        rescale = st.checkbox("Rescale weights to 100% if they do not add up", value=False)
-        value = st.number_input("Portfolio value (EUR)", min_value=1_000.0, max_value=1e10, value=1_000_000.0,
-                                step=50_000.0, format="%.0f")
-        c1, c2 = st.columns(2)
-        start = c1.date_input("Start date", value=date(2019, 1, 1), min_value=date(2000, 1, 1), max_value=date.today())
-        end = c2.date_input("End date", value=date(2026, 10, 8), min_value=date(2001, 1, 1), max_value=date.today())
-
         st.markdown("## Risk settings")
         st.caption("Confidence levels")
         cc = st.columns(4)
@@ -139,23 +146,22 @@ with st.sidebar:
         window = st.slider("Estimation window (trading days)", 250, 2500, 1250, step=10,
                            help="Number of most recent daily returns used to estimate VaR and ES. 1,250 days ≈ 5 years.")
         n_sims = st.number_input("Monte Carlo simulations", min_value=1_000, max_value=1_000_000, value=100_000, step=10_000)
-        fat_tails = st.toggle("Monte Carlo with Student-t shocks (ν = 5)", value=False,
-                              help="Off: multivariate normal, as in the course. On: fat-tailed multivariate Student-t.")
+        mc_model = st.radio("Monte Carlo return model", ["Normal distribution", "Student-t distribution (5 degrees of freedom)"])
+        st.caption("Normal: the standard bell curve. Student-t: extreme gains and losses are more frequent. "
+                   "The degrees of freedom (ν) control the thickness of the tails: a smaller ν means more extreme outcomes. "
+                   "Here ν is fixed at 5, with the same estimated volatility as the normal model.")
         seed = st.number_input("Random seed", min_value=0, max_value=2**31 - 1, value=42, step=1)
-        rf = st.number_input("Risk-free rate (% per year, for Sharpe)", min_value=-2.0, max_value=15.0, value=2.0, step=0.25) / 100
 
         st.markdown("## Backtesting")
         bt_window = st.slider("Rolling estimation window (days)", 250, 1000, 500, step=10)
         bt_mc = st.toggle("Include Monte Carlo VaR in the backtest", value=True, help="Re-simulates every day (5,000 draws); slower.")
+        st.caption("The Monte Carlo backtest uses the normal model as a fixed comparison benchmark.")
 
-        st.markdown("## Data")
-        refresh = st.toggle("Download fresh prices from Yahoo Finance", value=False,
-                            help="Off: uses the saved dataset when it covers the request (new tickers are always downloaded).")
         submitted = st.form_submit_button("Run analysis", type="primary", width="stretch")
 
 
 # =============================================================================== validation
-def validate(df, rescale, start, end, conf_flags):
+def validate(df, conf_flags):
     errs, warns = [], []
     df = df.copy()
     df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
@@ -175,15 +181,7 @@ def validate(df, rescale, start, end, conf_flags):
         if tot <= 0:
             errs.append("Weights add up to 0%.")
         elif abs(tot - 100) > 0.01:
-            if rescale:
-                df["Weight (%)"] = df["Weight (%)"] / tot * 100
-                warns.append(f"Weights added up to {tot:.2f}%; they were rescaled to 100%.")
-            else:
-                errs.append(f"Weights add up to {tot:.2f}%, not 100%. Fix them or tick “Rescale weights to 100%”.")
-    if start >= end:
-        errs.append("The start date must be before the end date.")
-    elif (pd.Timestamp(end) - pd.Timestamp(start)).days < 5 * 365:
-        warns.append("Less than 5 years of history: the project requires at least 5 years including 2020 and 2022.")
+            errs.append(f"Weights add up to {tot:.2f}%, not 100%. Adjust the weights in the portfolio table.")
     conf = tuple(sorted(a for a, on in conf_flags.items() if on))
     if not conf:
         errs.append("Tick at least one confidence level.")
@@ -191,7 +189,7 @@ def validate(df, rescale, start, end, conf_flags):
 
 
 if "config" not in st.session_state or submitted:
-    pdf, conf, errs, warns = validate(port_df, rescale, start, end, conf_flags)
+    pdf, conf, errs, warns = validate(port_df, conf_flags)
     if errs:
         if "config" not in st.session_state:
             st.title("Portfolio Risk Engine")
@@ -203,20 +201,24 @@ if "config" not in st.session_state or submitted:
     else:
         st.session_state.config = dict(
             tickers=tuple(pdf["Ticker"]), weights=tuple(pdf["Weight (%)"] / 100),
-            classes=tuple(pdf["Asset class"].fillna("").astype(str)), value=float(value), start=str(start), end=str(end),
-            conf=conf, horizon=int(horizon), window=int(window), n_sims=int(n_sims), dist="t" if fat_tails else "normal",
-            seed=int(seed), rf=float(rf), bt_window=int(bt_window), bt_mc=bool(bt_mc), refresh=bool(refresh),
+            classes=tuple(pdf["Asset class"].fillna("").astype(str)),
+            conf=conf, horizon=int(horizon), window=int(window), n_sims=int(n_sims),
+            dist="t" if mc_model.startswith("Student-t") else "normal",
+            seed=int(seed), bt_window=int(bt_window), bt_mc=bool(bt_mc),
             run_at=datetime.now().strftime("%d %b %Y, %H:%M"), warns=warns)
 
 cfg = st.session_state.config
+# Apply the study constants even to a session opened before these settings were fixed.
+cfg.update(value=PORTFOLIO_VALUE, start=str(STUDY_START), end=str(STUDY_END), rf=RISK_FREE_RATE)
+cfg.pop("refresh", None)
 for w_ in cfg["warns"]:
     st.warning(w_)
 
 
 # =============================================================================== computations (cached)
 @st.cache_data(show_spinner=False)
-def get_data(tickers, start, end, refresh, token):
-    raw, ccy, meta = rk.load_prices(list(tickers), start, end, DATA_DIR, refresh=refresh)
+def get_data(tickers, start, end):
+    raw, ccy, meta = rk.load_prices(list(tickers), start, end, DATA_DIR)
     prices, report = rk.build_eur_prices(raw, list(tickers), ccy)
     return raw, ccy, meta, prices, report
 
@@ -260,8 +262,7 @@ def rolling_corr(R):
 
 try:
     with st.spinner("Loading prices and aligning calendars…"):
-        raw, CCY, META, prices, REPORT = get_data(cfg["tickers"], cfg["start"], cfg["end"], cfg["refresh"],
-                                                   cfg["run_at"] if cfg["refresh"] else "cache")
+        raw, CCY, META, prices, REPORT = get_data(cfg["tickers"], cfg["start"], cfg["end"])
 except Exception as exc:
     st.title("Portfolio Risk Engine")
     st.error(f"Prices could not be loaded: {exc}")
@@ -270,7 +271,7 @@ except Exception as exc:
 
 if len(prices) < cfg["window"] + 20:
     st.error(f"Only {len(prices):,} common trading days are available for this portfolio, fewer than the estimation "
-             f"window of {cfg['window']:,} days. Shorten the window or extend the start date.")
+             f"window of {cfg['window']:,} days. Shorten the window or choose assets with more history in the fixed study period.")
     st.stop()
 
 with st.spinner("Estimating VaR and Expected Shortfall…"):
@@ -307,7 +308,7 @@ kpis = [
     (f"1-day ES {lab(A_TOP)} (historical)", eur(he1), f"{he1 / hv1:.2f} × VaR", True),
     (f"{H}-day VaR {lab(A_TOP)} (historical)", eur(hvH), f"{pct(hvH / V, 1)} of the portfolio", True),
     ("Annualised volatility", pct(ST.loc["Portfolio", "Ann. volatility"]), f"diversification ratio {div_ratio:.2f}", False),
-    ("Sharpe ratio", f"{ST.loc['Portfolio', 'Sharpe']:.2f}", f"return {pct(ST.loc['Portfolio', 'Ann. return'])} a year", False),
+    ("Sharpe ratio", f"{ST.loc['Portfolio', 'Sharpe']:.2f}", "Risk-free rate: 2% / year (fixed)", False),
     ("Maximum drawdown", pct(mdd), f"trough on {mdd_date:%d %b %Y}", False),
 ]
 st.markdown('<div class="kpi-strip">' + "".join(
@@ -405,7 +406,7 @@ with tabs[2]:
                  .bar(subset=["Ann. volatility"], color="#F1CFCB", vmin=0).bar(subset=["Sharpe"], color=["#F1CFCB", "#CFE3D4"], align="zero"),
                  width="stretch")
     st.caption(f"Full sample in EUR. Annual return = mean daily log return × 252; volatility = daily standard deviation × √252; "
-               f"Sharpe = (return − {pct(cfg['rf'], 2)}) / volatility.")
+               "Sharpe = (annual return − 2%) / annual volatility. Risk-free rate fixed at 2% per year.")
     s_ = ST.drop("Portfolio")
     most_vol, least_vol = s_["Ann. volatility"].idxmax(), s_["Ann. volatility"].idxmin()
     best_sh = s_["Sharpe"].idxmax()
@@ -562,14 +563,17 @@ with tabs[4]:
             f"(historical); a larger loss is expected about once every {1 / (1 - A_TOP):.0f} trading days. When it happens, the average "
             f"loss is the ES, {eur(P1.loc['Historical', f'ES {lab(A_TOP)}'])}. The normal model gives {eur(pv_)} "
             f"({(pv_ / hv_ - 1) * 100:+.0f}% versus history) because returns have excess kurtosis of {vi['exkurt']:.1f}: more mass in the "
-            f"centre and in the tails than the bell curve. Monte Carlo ({eur(mv_)}) simulates from the same "
-            f"{'Student-t' if cfg['dist'] == 't' else 'normal'} model, so it agrees with the parametric figure up to simulation noise.")
+            f"centre and in the tails than the bell curve. Monte Carlo ({eur(mv_)}) "
+            + ("uses Student-t with 5 degrees of freedom, so its tail risk can differ from the normal parametric figure."
+               if cfg['dist'] == 't' else
+               "uses the normal model, so it agrees with the parametric figure up to simulation noise."))
 
     st.markdown("#### Fat-tail variants of the parametric VaR (1 day)")
     st.dataframe(C["variants"].rename(index=lab).style.format("€{:,.0f}"), width="stretch")
     st.caption(f"Portfolio skewness {vi['skew']:.2f}, excess kurtosis {vi['exkurt']:.1f}, fitted Student-t ν = {vi['nu']:.1f}, "
-               f"EWMA volatility {pct(vi['sigma_ewma'], 2)} a day against {pct(vi['sigma_p'], 2)} over the window. Student-t "
-               f"and Cornish-Fisher widen the 99% quantile to account for fat tails; EWMA weights recent days more heavily, so it "
+               f"EWMA volatility {pct(vi['sigma_ewma'], 2)} a day against {pct(vi['sigma_p'], 2)} over the window. "
+               f"ν here is estimated from the portfolio returns; it is separate from the fixed ν = 5 in the Monte Carlo option. "
+               f"Student-t and Cornish-Fisher adjust the quantile for fat tails; EWMA weights recent days more heavily, so it "
                f"reflects today's volatility regime rather than the window average.")
     st.markdown("#### Monte Carlo convergence (VaR 99%, 25 independent runs per size)")
     conv = convergence(est, cfg["weights"], V, cfg["seed"])
@@ -679,12 +683,12 @@ with tabs[6]:
         for k_, (nm, a0, a1) in rk.EPISODES.items():
             covered = pd.Timestamp(a0) >= prices.index.min()
             ep_on[k_] = st.checkbox(f"{nm} ({a0[:7]} to {a1[:7]})", value=covered, disabled=not covered, key=f"ep_{k_}",
-                                    help=None if covered else "Not covered by the data: set the start date before this episode.")
+                                    help=None if covered else "Not covered by the fixed study period (2019–2026).")
         use_custom = st.checkbox("Custom episode", value=False, key="ep_custom")
         if use_custom:
             ce1, ce2 = st.columns(2)
-            c_start = ce1.date_input("From", value=date(2018, 10, 1), key="ce_s")
-            c_end = ce2.date_input("To", value=date(2018, 12, 24), key="ce_e")
+            c_start = ce1.date_input("From", value=date(2020, 2, 19), min_value=STUDY_START, max_value=STUDY_END, key="ce_s")
+            c_end = ce2.date_input("To", value=date(2020, 3, 23), min_value=STUDY_START, max_value=STUDY_END, key="ce_e")
             c_name = st.text_input("Name", value="Custom episode", key="ce_n")
         proxy = st.text_input("Proxy for assets without history", value=betas_mkt, key="proxy").strip().upper()
         if proxy not in TICK:
@@ -897,8 +901,8 @@ with tabs[8]:
         ("5. Why does Monte Carlo VaR differ from Historical VaR?",
          f"Monte Carlo ({eur(mc[f'VaR {lab(A_TOP)}'])}) draws from a fitted {'Student-t' if cfg['dist'] == 't' else 'normal'} model, so it "
          f"converges to the model quantile, not to the empirical one: the gap with history is a model choice, not simulation noise "
-         f"(standard error {eur(conv.loc[100_000, 'Std. error'])} with 100,000 draws). Switching on Student-t shocks in the sidebar moves it "
-         f"towards the historical figure."),
+         f"(standard error {eur(conv.loc[100_000, 'Std. error'])} with 100,000 normal draws). Selecting Student-t in the sidebar "
+         f"makes extreme simulated returns more frequent; it does not guarantee agreement with history."),
         ("6. Why is Expected Shortfall useful in addition to VaR?",
          f"VaR says where the tail starts, ES how deep it goes: historical ES is {hist[f'ES {lab(A_TOP)}'] / hist[f'VaR {lab(A_TOP)}']:.2f} × VaR "
          f"against {par[f'ES {lab(A_TOP)}'] / par[f'VaR {lab(A_TOP)}']:.2f} under normality, so the real tail is thicker than VaR suggests. "
@@ -940,3 +944,36 @@ with tabs[8]:
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
     st.caption("Portfolio Risk Engine — MSc Finance & Big Data, NEOMA Business School. Data: Yahoo Finance. "
                "For educational use; not investment advice.")
+
+
+# The notebook stays below every tab so it is always at the bottom of the page.
+st.divider()
+st.subheader("Python notebook")
+st.caption("Step-by-step calculations with short explanations in French. The download uses the portfolio and risk settings "
+           "from the last valid analysis, with the predefined stress scenarios. Download both files into the same folder, "
+           "then run the notebook from top to bottom in Jupyter or VS Code.")
+
+
+def build_notebook():
+    with open(os.path.join(APP_DIR, "portfolio_risk.ipynb"), encoding="utf-8") as file:
+        notebook = json.load(file)
+    parameters = {
+        "portfolio_value": PORTFOLIO_VALUE, "start_date": str(STUDY_START), "end_date": str(STUDY_END),
+        "risk_free_rate": RISK_FREE_RATE, "trading_days": 252,
+        "tickers": TICK, "weights": [float(weight) for weight in cfg["weights"]], "currencies": {t: CCY[t] for t in TICK},
+        "confidence_levels": list(CONF), "horizon": H, "estimation_window": cfg["window"],
+        "n_simulations": cfg["n_sims"], "seed": cfg["seed"], "mc_distribution": cfg["dist"],
+        "degrees_of_freedom": 5, "backtest_window": cfg["bt_window"], "include_mc_backtest": cfg["bt_mc"],
+    }
+    for cell in notebook["cells"]:
+        if "parameters" in cell.get("metadata", {}).get("tags", []):
+            cell["source"] = ["# Paramètres de la dernière analyse validée dans l'application.\n"] + [
+                f"{name} = {value!r}\n" for name, value in parameters.items()]
+    return json.dumps(notebook, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+notebook_column, data_column = st.columns(2)
+notebook_column.download_button("Download the notebook (.ipynb)", build_notebook(), "portfolio_risk.ipynb",
+                                "application/x-ipynb+json", width="stretch", on_click="ignore")
+data_column.download_button("Download the notebook data (.csv)", raw.to_csv().encode("utf-8"), "yahoo_adj_close.csv",
+                            "text/csv", width="stretch", on_click="ignore")
